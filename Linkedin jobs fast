@@ -1,0 +1,560 @@
+// ==UserScript==
+// @name               LinkedIn Jobs — Hızlı & Gizle
+// @name:tr            LinkedIn İş Arama — Hızlı & Gizle
+// @namespace          https://greasyfork.org/
+// @version            1.0.0
+// @description        Görüntülenen/başvurulan ilanları ayrı ayrı gizler; tüm animasyonları öldürür, content-visibility ile RAM kullanımını düşürür, gereksiz DOM elemanlarını siler.
+// @match              https://www.linkedin.com/*
+// @grant              none
+// @run-at             document-idle
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ─── AYARLAR ─────────────────────────────────────────────────────────────────
+  const SK = {
+    hideViewed:  'ljf-hv',   // görüntülenen ilanları gizle
+    hideApplied: 'ljf-ha',   // başvurulan ilanları gizle
+    perfMode:    'ljf-pm',   // performans modu (animasyon öldürme, DOM temizleme)
+  };
+
+  function load(k, def) {
+    try { const v = localStorage.getItem(k); return v === null ? def : v === '1'; }
+    catch { return def; }
+  }
+  function save(k, v) {
+    try { localStorage.setItem(k, v ? '1' : '0'); } catch {}
+  }
+
+  let hideViewed  = load(SK.hideViewed,  true);
+  let hideApplied = load(SK.hideApplied, true);
+  let perfMode    = load(SK.perfMode,    true);
+
+  // ─── ANAHTAR KELİMELER ───────────────────────────────────────────────────────
+  const VIEWED_KW = [
+    'viewed','görüntülendi','görüntülenen','seen',
+    'visto','vu','angesehen','visualizzato','bekeken',
+    'просмотрено','wyświetlono','visad','sedd',
+    '已查看','已檢視','閲覧済み','조회됨','تمت المشاهدة','देखा गया',
+  ];
+  const APPLIED_KW = [
+    'applied','başvurulan','başvuruldu','başvurulanlar',
+    'aplicado','postulado','candidatado','postulé','beworben',
+    'candidatura','solliciteerd','откликнулся','aplikowano','sökt',
+    '已申请','已申請','応募済み','지원함','지원 완료','تم التقديم','आवेदन किया गया',
+  ];
+
+  function norm(s) {
+    return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  }
+
+  function hasKw(text, list) {
+    const t = norm(text);
+    for (const kw of list) {
+      const k = norm(kw);
+      let pos = 0;
+      while (pos < t.length) {
+        const i = t.indexOf(k, pos);
+        if (i === -1) break;
+        const bef = i > 0 ? t[i - 1] : '';
+        const aft = i + k.length < t.length ? t[i + k.length] : '';
+        if (!/[a-z0-9]/.test(bef) && !/[a-z0-9]/.test(aft)) return true;
+        pos = i + 1;
+      }
+    }
+    return false;
+  }
+
+  // ─── KART DURUMU TESPİTİ ─────────────────────────────────────────────────────
+  function getCardState(card) {
+    // 1. Önce footer/durum etiketlerine bak (en güvenilir sinyal)
+    const footerSels = [
+      'li.job-card-container__footer-job-state',
+      'li[class*="footer-job-state"]',
+      '.job-card-container__footer-wrapper li',
+      '[class*="job-state"]',
+      '[data-jobstate]',
+      'span.job-card-list__footer',
+    ];
+    for (const sel of footerSels) {
+      for (const el of card.querySelectorAll(sel)) {
+        const t = (el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+        if (hasKw(t, APPLIED_KW)) return 'applied';
+        if (hasKw(t, VIEWED_KW))  return 'viewed';
+      }
+    }
+
+    // 2. Tüm liste elemanlarını tara
+    for (const el of card.querySelectorAll('ul li')) {
+      const t = el.textContent || '';
+      if (hasKw(t, APPLIED_KW)) return 'applied';
+      if (hasKw(t, VIEWED_KW))  return 'viewed';
+    }
+
+    // 3. aria-label ve title özelliklerine bak
+    for (const el of card.querySelectorAll('[aria-label],[title]')) {
+      const t = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '');
+      if (hasKw(t, APPLIED_KW)) return 'applied';
+      if (hasKw(t, VIEWED_KW))  return 'viewed';
+    }
+
+    // 4. Kart içindeki span ve küçük metinlere bak
+    let checked = 0;
+    for (const el of card.querySelectorAll('span, small, p')) {
+      if (checked++ > 60) break;
+      const t = el.textContent || '';
+      if (hasKw(t, APPLIED_KW)) return 'applied';
+      if (hasKw(t, VIEWED_KW))  return 'viewed';
+    }
+
+    return null;
+  }
+
+  // ─── SEÇICILER ───────────────────────────────────────────────────────────────
+  const CARD_PARTS = [
+    '[data-occludable-job-id]',
+    'li.jobs-search-results__list-item',
+    'li.scaffold-layout__list-item',
+    'li.discovery-templates-entity-item',
+    'article.job-search-card',
+    'div.base-card',
+    'article.base-card',
+    'li.jobs-collections-module__list-item',
+    'li.jobs-collection__list-item',
+  ];
+  const CARD_SEL = CARD_PARTS.join(',');
+
+  // Animasyon öldürme için hedef seçiciler (daha dar = daha az yan etki)
+  const ANIM_TARGETS = [
+    '.job-card-container',
+    '.job-card-list',
+    '.base-card',
+    '.jobs-search-results-list',
+    '.scaffold-layout__list',
+    '[data-occludable-job-id]',
+    'li.jobs-search-results__list-item',
+  ].join(',');
+
+  // Silinecek gereksiz elemanlar
+  const JUNK_SELS = [
+    '.msg-overlay-list-bubble',           // sağ alt chat balonu
+    '.msg-overlay-bubble-header',
+    '.ad-banner-container',               // reklam banner
+    '[data-ad-banner]',
+    '.jobs-premium-upsell',               // premium satış kutusu
+    '.artdeco-global-alert-container',    // çerez/bildirim banner
+    '.global-alert-banner',
+    '.trending-now-container',
+    '.learning-recommendation',           // LinkedIn Learning önerisi
+    '.pymk-widget',                       // "Tanıyor olabilirsiniz"
+    '.sponsored-content',
+    '[data-view-name="job-card-premium-insight"]',
+  ];
+
+  // ─── CSS ENJEKTE ET ──────────────────────────────────────────────────────────
+  function injectCSS() {
+    let el = document.getElementById('ljf-style');
+    if (!el) {
+      el = document.createElement('style');
+      el.id = 'ljf-style';
+      document.head.appendChild(el);
+    }
+    el.textContent = buildCSS();
+  }
+
+  function buildCSS() {
+    // Gizleme kuralı: kart 1px'e çöküyor, görünmez oluyor
+    const hideCSS = `
+      [data-ljf-hidden] {
+        height: 1px !important;
+        min-height: 0 !important;
+        max-height: 1px !important;
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `;
+
+    // Performans optimizasyonları
+    const perfCSS = perfMode ? `
+      /* ── Animasyon / transition tamamen kapat ── */
+      ${ANIM_TARGETS} * {
+        animation: none !important;
+        animation-duration: 0s !important;
+        animation-delay: 0s !important;
+        transition: none !important;
+        transition-duration: 0s !important;
+        transition-delay: 0s !important;
+      }
+
+      /* ── GPU katmanı oluşturan pahalı özellikler ── */
+      ${ANIM_TARGETS} * {
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+        will-change: auto !important;
+        filter: none !important;
+        transform: none !important;
+      }
+
+      /* ── content-visibility: auto — en büyük RAM kazancı ──
+         Ekran dışındaki kartların içeriğini browser render etmez.
+         250 kart olsa bile sadece görünende CPU/RAM harcar. */
+      ${CARD_PARTS.filter(s => !s.startsWith('.')).join(',\n      ')},
+      li.jobs-search-results__list-item,
+      li.scaffold-layout__list-item {
+        content-visibility: auto;
+        contain-intrinsic-size: 0px 100px;
+      }
+
+      /* Gizlenen kartlara content-visibility uygulanmasın */
+      [data-ljf-hidden] {
+        content-visibility: visible !important;
+        contain-intrinsic-size: unset !important;
+      }
+
+      /* ── Hover gölgelerini basitleştir ── */
+      .job-card-container:hover {
+        box-shadow: 0 0 0 1px #0a66c2 !important;
+        transform: none !important;
+      }
+
+      /* ── Skeleton loader animasyonları ── */
+      .artdeco-card__loading-state,
+      [class*="skeleton"],
+      [class*="loading-state"] {
+        animation: none !important;
+        background: #e8eaed !important;
+      }
+
+      /* ── Reklam ve gereksiz kutular ── */
+      .jobs-premium-upsell,
+      .ad-banner-container,
+      [data-ad-banner],
+      .artdeco-global-alert-container {
+        display: none !important;
+      }
+    ` : '';
+
+    // Rozet (badge) stili
+    const badgeCSS = `
+      #ljf-badge {
+        position: fixed;
+        top: 72px;
+        right: 14px;
+        z-index: 999999;
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        user-select: none;
+        pointer-events: none;
+      }
+      #ljf-badge > .ljf-row {
+        background: rgba(16,22,28,0.93);
+        border: 1px solid rgba(255,255,255,0.13);
+        border-radius: 999px;
+        padding: 4px 10px 4px 8px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+        pointer-events: all;
+        width: fit-content;
+      }
+      #ljf-badge .ljf-count {
+        font-size: 14px;
+        font-weight: 700;
+        color: #e4eaf0;
+        min-width: 18px;
+        text-align: right;
+      }
+      #ljf-badge .ljf-label {
+        font-size: 10px;
+        color: #6e8090;
+        font-weight: 500;
+        margin-right: 2px;
+      }
+      #ljf-badge button.ljf-btn {
+        border: 1px solid rgba(255,255,255,0.18);
+        border-radius: 999px;
+        padding: 3px 9px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+        cursor: pointer;
+        background: rgba(255,255,255,0.07);
+        color: #9aabb8;
+        line-height: 1.4;
+      }
+      #ljf-badge button.ljf-btn:hover {
+        background: rgba(255,255,255,0.13);
+        color: #c8d8e4;
+      }
+      #ljf-badge button.ljf-btn.on {
+        background: rgba(10,102,194,0.28);
+        border-color: rgba(10,102,194,0.65);
+        color: #7ec8ff;
+      }
+      #ljf-badge button.ljf-btn.on:hover {
+        background: rgba(10,102,194,0.38);
+      }
+      #ljf-badge button.ljf-perf.on {
+        background: rgba(245,158,11,0.22);
+        border-color: rgba(245,158,11,0.55);
+        color: #fcd47a;
+      }
+      @media (max-width: 900px) {
+        #ljf-badge { top: 60px; right: 8px; }
+      }
+    `;
+
+    return hideCSS + perfCSS + badgeCSS;
+  }
+
+  // ─── ROZET (BADGE) UI ────────────────────────────────────────────────────────
+  let badge     = null;
+  let countEl   = null;
+  let btnV      = null;
+  let btnA      = null;
+  let btnP      = null;
+
+  function ensureBadge() {
+    if (badge && document.body.contains(badge)) return;
+
+    badge = document.createElement('div');
+    badge.id = 'ljf-badge';
+
+    const row = document.createElement('div');
+    row.className = 'ljf-row';
+
+    countEl = document.createElement('span');
+    countEl.className = 'ljf-count';
+    countEl.textContent = '0';
+
+    const lbl = document.createElement('span');
+    lbl.className = 'ljf-label';
+    lbl.textContent = 'gizli';
+
+    btnV = makeBtn('Görüntülenen', hideViewed, val => {
+      hideViewed = val;
+      save(SK.hideViewed, val);
+      processCards();
+    });
+
+    btnA = makeBtn('Başvurulan', hideApplied, val => {
+      hideApplied = val;
+      save(SK.hideApplied, val);
+      processCards();
+    });
+
+    btnP = makeBtn('⚡ Hız', perfMode, val => {
+      perfMode = val;
+      save(SK.perfMode, val);
+      injectCSS();
+      if (val) applyPerfOptimizations();
+    }, 'ljf-perf');
+
+    row.appendChild(countEl);
+    row.appendChild(lbl);
+    row.appendChild(btnV);
+    row.appendChild(btnA);
+    row.appendChild(btnP);
+    badge.appendChild(row);
+    document.body.appendChild(badge);
+  }
+
+  function makeBtn(label, active, onChange, extraClass = '') {
+    const btn = document.createElement('button');
+    btn.className = 'ljf-btn' + (extraClass ? ' ' + extraClass : '') + (active ? ' on' : '');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.addEventListener('click', () => {
+      const newVal = !btn.classList.contains('on');
+      btn.classList.toggle('on', newVal);
+      onChange(newVal);
+    });
+    return btn;
+  }
+
+  function removeBadge() {
+    badge?.remove();
+    badge = countEl = btnV = btnA = btnP = null;
+  }
+
+  // ─── KART GİZLEME ────────────────────────────────────────────────────────────
+  function processCards() {
+    if (!isJobsPage()) { removeBadge(); return; }
+    ensureBadge();
+
+    const cards = document.querySelectorAll(CARD_SEL);
+    let hidden = 0;
+
+    for (const card of cards) {
+      const state = getCardState(card);
+      const shouldHide =
+        (state === 'viewed'  && hideViewed) ||
+        (state === 'applied' && hideApplied);
+
+      if (shouldHide) {
+        card.setAttribute('data-ljf-hidden', state);
+        hidden++;
+      } else if (card.hasAttribute('data-ljf-hidden')) {
+        // Mod kapatıldıysa gizlemeyi kaldır
+        const hiddenState = card.getAttribute('data-ljf-hidden');
+        const stillHidden =
+          (hiddenState === 'viewed'  && hideViewed) ||
+          (hiddenState === 'applied' && hideApplied);
+        if (!stillHidden) card.removeAttribute('data-ljf-hidden');
+      }
+    }
+
+    if (countEl) countEl.textContent = String(hidden);
+  }
+
+  function isJobsPage() {
+    return location.pathname.includes('/jobs');
+  }
+
+  // ─── PERFORMANS OPTİMİZASYONLARI ─────────────────────────────────────────────
+  function applyPerfOptimizations() {
+    if (!perfMode) return;
+    removeJunkElements();
+    stripFarImages();
+  }
+
+  function removeJunkElements() {
+    for (const sel of JUNK_SELS) {
+      document.querySelectorAll(sel).forEach(el => el.remove());
+    }
+  }
+
+  /**
+   * Görünüm alanının çok uzağındaki iş kartı resimlerini boşaltır.
+   * LinkedIn bu resimleri memory'de tutar; boşaltmak önemli RAM kazancı sağlar.
+   * Karta yaklaşıldığında resimler geri yüklenir.
+   */
+  function stripFarImages() {
+    if (!perfMode) return;
+
+    const VH     = window.innerHeight;
+    const MARGIN = VH * 5; // 5 ekran ötesi
+
+    for (const img of document.querySelectorAll(CARD_SEL + ' img')) {
+      const rect = img.getBoundingClientRect();
+      const isFar = rect.top > VH + MARGIN || rect.bottom < -MARGIN;
+
+      if (isFar) {
+        if (!img.dataset.ljfSrc && img.src && !img.src.startsWith('data:')) {
+          img.dataset.ljfSrc = img.src;
+          // 1x1 şeffaf GIF — sıfır bellek
+          img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+          img.removeAttribute('srcset');
+          img.removeAttribute('data-delayed-url');
+        }
+      } else {
+        // Yaklaştıysa geri yükle
+        if (img.dataset.ljfSrc) {
+          img.src = img.dataset.ljfSrc;
+          delete img.dataset.ljfSrc;
+        }
+      }
+    }
+  }
+
+  // ─── OBSERVER & ZAMANLAYICILAR ────────────────────────────────────────────────
+  let rafId      = null;
+  let mutTimer   = null;
+  let scrollTimer = null;
+
+  function scheduleRefresh() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      processCards();
+      if (perfMode) applyPerfOptimizations();
+    });
+  }
+
+  // MutationObserver: yeni kartlar yüklendiğinde tetiklenir, 150ms debounce
+  const observer = new MutationObserver(() => {
+    if (mutTimer) return;
+    mutTimer = setTimeout(() => { mutTimer = null; scheduleRefresh(); }, 150);
+  });
+
+  // ─── ROTA TAKİBİ (SPA navigasyon) ────────────────────────────────────────────
+  let lastPath = location.pathname;
+
+  function onMaybeRouteChange() {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    // Yeni sayfa yüklenmesi için biraz bekle
+    setTimeout(scheduleRefresh, 300);
+    setTimeout(scheduleRefresh, 900);
+    setTimeout(scheduleRefresh, 2000);
+  }
+
+  function patchHistory(method) {
+    const orig = history[method].bind(history);
+    history[method] = function (...args) {
+      const result = orig(...args);
+      onMaybeRouteChange();
+      return result;
+    };
+  }
+
+  // ─── BAŞLATMA ────────────────────────────────────────────────────────────────
+  function init() {
+    injectCSS();
+
+    if (isJobsPage()) {
+      scheduleRefresh();
+      // Biraz geç de bir daha çalıştır (lazy render için)
+      setTimeout(scheduleRefresh, 500);
+      setTimeout(scheduleRefresh, 1500);
+      if (perfMode) setTimeout(applyPerfOptimizations, 800);
+    }
+
+    // DOM değişikliklerini izle
+    if (document.body) {
+      observer.observe(document.body, { childList: true, subtree: true });
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+      }, { once: true });
+    }
+
+    // SPA rota değişikliklerini yakala
+    patchHistory('pushState');
+    patchHistory('replaceState');
+    window.addEventListener('popstate', onMaybeRouteChange);
+    window.addEventListener('hashchange', onMaybeRouteChange);
+
+    // Kaydırırken uzak resimleri boşalt (throttled)
+    window.addEventListener('scroll', () => {
+      if (scrollTimer) return;
+      scrollTimer = setTimeout(() => {
+        scrollTimer = null;
+        if (perfMode) stripFarImages();
+      }, 400);
+    }, { passive: true });
+
+    // 2 saniyede bir periyodik tarama (dinamik içerik için güvence)
+    setInterval(() => {
+      if (isJobsPage()) scheduleRefresh();
+    }, 2000);
+  }
+
+  // Sayfa yüklenmesini bekle
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+
+})();
