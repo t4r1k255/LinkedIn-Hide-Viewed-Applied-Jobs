@@ -38,8 +38,15 @@ LinkedIn'de `/jobs` sayfasına girdiğinde sağ üst köşede küçük bir panel
 
 Panelin solundaki sayı o an kaç ilanın gizlendiğini gösterir.
 
+## ⚠️ Yasal Uyarı
+
+Bu script LinkedIn ile herhangi bir bağlantısı olmayan bağımsız bir topluluk aracıdır. LinkedIn'in [Kullanım Koşulları](https://www.linkedin.com/legal/user-agreement)'na uygun şekilde kullan.
+
 ---
 
-## Lisans
+## 📄 Lisans
+
+[MIT License](LICENSE)
+
 
 MIT
