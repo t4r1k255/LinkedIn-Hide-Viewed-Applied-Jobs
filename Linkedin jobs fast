@@ -1,3 +1,14 @@
+// ==UserScript==
+// @name         Linkedin jobs fast
+// @namespace    https://github.com/t4r1k255/LinkedIn-Hide-Viewed-Applied-Jobs
+// @version      1.0
+// @description  Used for hiding viewed and/or applied applied job applications.
+// @author       t4r1k255
+// @match        https://www.linkedin.com/jobs/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=linkedin.com
+// @grant        none
+// @license      MIT
+// ==/UserScript==
 
 (function () {
   'use strict';
