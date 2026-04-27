@@ -1,14 +1,3 @@
-// ==UserScript==
-// @name               LinkedIn Jobs — Hızlı & Gizle
-// @name:tr            LinkedIn İş Arama — Hızlı & Gizle
-// @namespace          https://greasyfork.org/
-// @version            1.0.0
-// @description        Görüntülenen/başvurulan ilanları ayrı ayrı gizler; tüm animasyonları öldürür, content-visibility ile RAM kullanımını düşürür, gereksiz DOM elemanlarını siler.
-// @match              https://www.linkedin.com/*
-// @grant              none
-// @run-at             document-idle
-// @noframes
-// ==/UserScript==
 
 (function () {
   'use strict';
